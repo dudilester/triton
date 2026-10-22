@@ -321,6 +321,7 @@ private:
 
     // Factor the contiguous scan axis out of the register layout. The
     // quotient maps each independent scan to its shared-memory base.
+    // e.g., R = [[0, 1], [0, 2], [0, 4], [32, 0]] -> R = [[32, 0]]
     auto scanAxis = LinearLayout::identity1D(numTotals, kReg, axis);
     scan = regPermForDivide(scan, scanAxis, /*left=*/true)->apply(scan);
     auto independentScans = divideLeft(scan, scanAxis).value();
@@ -329,7 +330,7 @@ private:
     dims.push_back(axis);
     auto storeLayout = source.transposeOuts(dims).flattenOuts();
     auto loadLayout = independentScans.transposeOuts(dims).flattenOuts();
-    unsigned rowStride = independentScans.getTotalOutDimSize();
+    unsigned stride = independentScans.getTotalOutDimSize();
     auto scratch = helper.getGroupedInterWarpScratchConfig();
     Value smem = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
     SmallVector<Value> bases;
@@ -339,7 +340,7 @@ private:
           b.gep(smem.getType(), i8_ty, smem, b.i32_val(scratch.offsets[i])));
       types.push_back(getTypeConverter()->convertType(type));
     }
-    auto offset = [&](const LinearLayout &layout, unsigned reg) {
+    auto getOffset = [&](const LinearLayout &layout, unsigned reg) {
       return applyLinearLayout(loc, rewriter, layout,
                                {{kReg, b.i32_val(reg)},
                                 {kLane, laneId},
@@ -353,9 +354,9 @@ private:
         b.and_(b.icmp_eq(b.and_(laneId, b.i32_val(free[kLane])), b.i32_val(0)),
                b.icmp_eq(b.and_(warpId, b.i32_val(free[kWarp])), b.i32_val(0)));
     for (auto [r, total] : llvm::enumerate(totals)) {
-      Value index = offset(storeLayout, r);
+      Value offset = getOffset(storeLayout, r);
       for (unsigned i = 0; i < total.size(); ++i) {
-        Value ptr = b.gep(smem.getType(), types[i], bases[i], index);
+        Value ptr = b.gep(smem.getType(), types[i], bases[i], offset);
         targetInfo.storeDShared(rewriter, loc, ptr, Value(), total[i],
                                 storePred);
       }
@@ -383,6 +384,15 @@ private:
       Value pred = b.icmp_ne(index, b.i32_val(reverse ? numTotals - 1 : 0));
       consumerRegs.push_back(
           applyLinearLayout(loc, rewriter, inverse, coords).front().second);
+      // A simple implementation visits every prefix for every destination:
+      //   for (each prefix Qj)
+      //     for (each destination r)
+      //       carry[r] = select(consumerRegs[r] == j + 1, Qj, carry[r]);
+      //
+      // Enumerating candidate prefixes reduces the selections:
+      //   for (each destination r)
+      //     for (each candidate prefix Qc)
+      //       carry[r] = select(consumerRegs[r] == c + 1, Qc, carry[r]);
       auto candidates =
           getScanRegisters(source, inverse, r, op.getAxis(), numTotals,
                            inclusive ? 0 : (reverse ? 1 : -1),
@@ -398,12 +408,12 @@ private:
     unsigned numScans = independentScans.getInDimSize(kReg);
     for (unsigned n = 0; n < numScans; ++n) {
       unsigned scanIndex = reverse ? numScans - 1 - n : n;
-      Value base = offset(loadLayout, scanIndex);
+      Value base = getOffset(loadLayout, scanIndex);
       SmallVector<Value> acc;
       for (unsigned i = 0; i < numTotals; ++i) {
         unsigned segment = reverse ? numTotals - 1 - i : i;
         unsigned reg = scanIndex * numTotals + segment;
-        Value index = b.add(base, b.i32_val(segment * rowStride));
+        Value index = b.add(base, b.i32_val(segment * stride));
         SmallVector<Value> current;
         for (unsigned i = 0; i < types.size(); ++i) {
           Value ptr = b.gep(smem.getType(), types[i], bases[i], index);
@@ -411,13 +421,18 @@ private:
                                                    types[i], b.true_val()));
         }
         acc = applyCombineOp(loc, rewriter, op.getCombineOp(), acc, current);
+        // `complete` marks the last candidate producer for consumer r in scan
+        // order.
+        // Once all candidates have been considered, apply the selected carry to
+        // the elements of segment r. For example:
+        //   consumers[1] = {{0, false}};
+        //   consumers[2] = {{0, true}, {1, false}};
+        //   consumers[3] = {{1, true}};
         for (auto [r, complete] : consumers[reg]) {
           auto &carry = carries[r];
           if (carry.values.empty()) {
             carry.values = acc;
           } else {
-            // Axis registers are consecutive. An exclusive prefix serves
-            // the adjacent consumer register in traversal order.
             unsigned consumer = inclusive ? reg : (reverse ? reg - 1 : reg + 1);
             Value selected = b.icmp_eq(consumerRegs[r], b.i32_val(consumer));
             for (unsigned i = 0; i < types.size(); ++i)
