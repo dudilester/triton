@@ -81,8 +81,6 @@ private:
     permuteRegisters(values, helper.getRegisterOrder().inverse());
   }
 
-  // Change the C++ container order for operand-wise layout conversion. This
-  // transposition emits no IR and does not change hardware ownership.
   static ScanValues transposeValues(const ScanValues &values) {
     ScanValues result(values.front().size());
     for (const auto &row : values)
@@ -110,7 +108,6 @@ private:
     return values;
   }
 
-  // Shift segment indices within a scan, preserving bits for other scans.
   static Value shiftWithinSegment(TritonLLVMOpBuilder &b, Value index,
                                   int distance, unsigned segmentsPerScan,
                                   unsigned numSegments) {
@@ -144,11 +141,6 @@ private:
     values = transposeValues(operands);
   }
 
-  // Scan each thread-local segment in traversal order, preserving combiner
-  // operand order for both forward and reverse scans. A segment of n values
-  // needs n-1 combines, and every intermediate result is an output prefix.
-  // Reversing the register traversal also puts its total in the first register;
-  // no preliminary register reversal or identity value is required.
   void scanWithinThreads(triton::ScanOp op, ScanValues &values,
                          unsigned numRegs,
                          ConversionPatternRewriter &rewriter) const {
@@ -455,11 +447,6 @@ private:
     }
   }
 
-  // Add inter-warp carries to the warp-local prefixes in intraWarpScanLayout,
-  // then restore intraWarpTotalsLayout. Each inclusive prefix replaces its
-  // thread segment's terminal value. Fetch the preceding segment's prefix for
-  // the remaining elements, using the retained inter-warp carry at a warp-local
-  // boundary. The scan boundary preserves its original element prefixes.
   void applyScanCarries(triton::ScanOp op, const ScanLoweringHelper &helper,
                         ScanValues &values, ScanValues &intraWarpTotals,
                         ArrayRef<ScanCarry> interWarpCarries, Value laneId,
@@ -476,17 +463,11 @@ private:
     unsigned segmentRegs = helper.getThreadSegmentSize();
     unsigned numSegments = helper.getWarpSegmentSize() / segmentRegs;
     const auto &scanLayout = *helper.getIntraWarpScanLayout();
-    // Include the inter-warp prefix once per thread total. Fetching the
-    // preceding total then supplies one complete carry to each saved local
-    // prefix, so those elements need a single final combine.
     if (!interWarpCarries.empty())
       applySegmentCarries(op, intraWarpTotals, interWarpCarries, rewriter);
     convertScanValues(op, intraWarpTotals, scanLayout, intraWarpTotalsLayout,
                       rewriter);
 
-    // Reuse the inclusive prefix for each terminal element, saving one combine
-    // and its boundary select per thread segment. One-value segments are now
-    // complete and avoid the subsequent predecessor gather entirely.
     for (unsigned r = 0; r < intraWarpTotals.size(); ++r)
       values[r * segmentRegs + (op.getReverse() ? 0 : segmentRegs - 1)] =
           intraWarpTotals[r];
@@ -500,8 +481,6 @@ private:
       unsigned segmentsPerWarp = carries.size() / interWarpCarries.size();
       for (auto [r, carry] : llvm::enumerate(carries)) {
         const auto &interWarpCarry = interWarpCarries[r / segmentsPerWarp];
-        // The first thread segment has no preceding local total. Use the
-        // inter-warp carry there, and leave the scan boundary untouched.
         for (auto [value, interWarpValue] :
              llvm::zip(carry.values, interWarpCarry.values))
           value = b.select(carry.pred, value, interWarpValue);
