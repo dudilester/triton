@@ -280,17 +280,18 @@ private:
     if (segmentLaneMask)
       storePred = b.icmp_eq(b.and_(laneId, b.i32_val(segmentLaneMask)),
                             b.i32_val(reverse ? 0 : segmentLaneMask));
+    // 1. Register efficient path: Load totals incrementally and accumulate
+    // within each thread with a short register lifetime
     if (helper.useGroupedInterWarpScan()) {
       scanInterWarpGroups(op, helper, totals, values, laneId, warpId, rewriter);
       return {};
     }
+    // 2. General path: Load totals in each warp at once and perform intra-warp
+    // scan, then compute carries of each warp through shuffles. It enjoys fewer
+    // arith instructions and more parallelism.
     convertScanValues(op, totals, interWarpTotalsLayout, totalsLayout, rewriter,
                       /*forceWarpShuffle=*/false, storePred);
 
-    // Replication makes the full totals sequence available within each warp.
-    // Reuse the CTA scan with no further inter-warp phase. Consumer warps then
-    // fetch their carries locally, avoiding a shared-memory exchange to return
-    // completed prefixes to the original warp owners.
     ScanLoweringHelper totalsHelper(totalsLayout, op.getAxis());
     scanWithinCTA(op, totalsHelper, totals, laneId, warpId, rewriter);
     return getSegmentCarries(op, totals, interWarpTotalsLayout, totalsLayout,
