@@ -570,12 +570,6 @@ private:
     return llvm::to_vector(candidates);
   }
 
-  // Select after shuffling: each destination lane may request a different
-  // register from its source lane. The predicate belongs to the receiving lane;
-  // applying it in the sending lane would choose a different register in
-  // general. The first candidate initializes the result. Each additional
-  // candidate needs one select per operand; all operands share the same source
-  // coordinates and selection predicate.
   SmallVector<Value> shuffleCarry(Location loc, const ScanValues &totals,
                                   ArrayRef<unsigned> candidates, Value srcReg,
                                   Value srcLane,
@@ -595,9 +589,6 @@ private:
     return carry;
   }
 
-  // Map each consumer segment to the preceding prefix in scan traversal order.
-  // Return a predicate excluding the first segment, without assuming an
-  // identity.
   SmallVector<ScanCarry>
   getSegmentCarries(triton::ScanOp op, const ScanValues &totals,
                     const LinearLayout &segmentLayout,
@@ -613,10 +604,6 @@ private:
     auto kBlock = StringAttr::get(ctx, "block");
     auto axis = StringAttr::get(ctx, "dim" + std::to_string(op.getAxis()));
     bool reverse = op.getReverse();
-    // Each requested nonboundary prefix is available within the consuming warp:
-    // interWarpScanLayout replicates the full sequence; intraWarpTotalsLayout
-    // holds the warp-local sequence. CTA ownership is preserved, so the source
-    // lookup uses only register and lane coordinates.
     auto inverse = totalsLayout.pseudoinvert().sublayout(
         llvm::to_vector(totalsLayout.getOutDimNames()), {kReg, kLane});
     unsigned numSegments = segmentLayout.getOutDimSize(axis);
@@ -635,7 +622,6 @@ private:
         segmentInScan = b.and_(segment, b.i32_val(segmentsPerScan - 1));
       Value pred = b.icmp_ne(segmentInScan,
                              b.i32_val(reverse ? segmentsPerScan - 1 : 0));
-      // Wrap within this scan; pred excludes the boundary without an identity.
       coords[op.getAxis()].second = shiftWithinSegment(
           b, segment, reverse ? 1 : -1, segmentsPerScan, numSegments);
       auto src = applyLinearLayout(loc, rewriter, inverse, coords);
